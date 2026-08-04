@@ -1,4 +1,8 @@
 <p align="center">
+  <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <img src="docs/assets/logo.png" alt="book-to-skill logo" width="120">
 </p>
 
