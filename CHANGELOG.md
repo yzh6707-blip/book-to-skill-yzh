@@ -5,6 +5,62 @@ All notable changes to **book-to-skill** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-08-04
+
+### Security
+- **Bidi prompt-injection defense** — extraction (`sanitize.py`) and the
+  generated-skill scanner now strip bidi override/isolate controls
+  (U+202A–U+202E, U+2066–U+2069) alongside zero-width characters, closing a
+  real document-borne injection vector that rendered invisibly in a diff.
+
+### Added
+- **Content-hash extraction cache** — per-source results are cached under
+  `<workdir>/cache/` keyed by SHA-256, so unchanged files (e.g. in the
+  Update/Fold-in flow) are never re-parsed; `--no-cache` forces a full pass.
+  `metadata.json` sources now include `file_sha256`.
+- **`probe` subcommand** — cross-platform (Windows/PowerShell-friendly)
+  replacement for `wc`/`grep`/`sed`: line/word/token counts, detected chapter
+  boundaries with line numbers, and `--chapter N` text slices.
+- **`tools/validate_generated.py`** — structural gate for generated skills:
+  frontmatter shape, chapter-index link resolution, required chapter headings,
+  token budgets, and grounding of bolded terms against the extracted source.
+  Runs in Step 9.5 of the workflow alongside the security scanner.
+- **Non-interactive mode** — `BOOK_SKILL_ASSUME`, `BOOK_SKILL_ASSUME_DEPTH` and
+  `BOOK_SKILL_NO_PROMPT` let CI/scripted pipelines run the full flow with no
+  prompts.
+- **Work-directory lock + stale-file cleanup** — a PID lock (dead-lock
+  auto-reclaim) plus cleanup of leftovers from interrupted runs prevent
+  concurrent or repeated runs from clobbering the shared work directory.
+- **OCR knobs** — scanned-PDF detection now uses a per-page average character
+  threshold (default 30 chars/page) with `BOOK_SKILL_FORCE_OCR`,
+  `BOOK_SKILL_NO_OCR` and `BOOK_SKILL_OCR_THRESHOLD` overrides.
+
+### Changed
+- **CJK-aware token estimation** — predominantly Chinese/Japanese/Korean text is
+  estimated by character count (~1.5 chars/token) instead of the English word
+  heuristic, which under-counted CJK by 3–4×.
+- **SKILL.md workflow** — Step 9.5 requires both `validate_generated.py` and
+  `scan_generated_skill.py`; Step 2.6 documents the `probe` subcommand for
+  Windows; Step 3 scans the title page when the opening characters don't reveal
+  title/author; fold-in notes the extraction cache.
+- **Work-dir cleanup** preserves the `cache/` directory across runs.
+
+### Fixed
+- **EPUB reading order** — `ebooklib` iterates the manifest rather than the
+  spine, so a publisher listing chapters out of order produced scrambled text
+  while the stdlib fallback was correct; both paths now share one OPF-spine
+  resolver.
+- **DOCX table position** — the `python-docx` path no longer appends all tables
+  after the paragraphs; both extraction paths emit document order.
+- **`pdfminer` timeout** — in-process extraction now enforces a 120s deadline
+  instead of hanging the CLI on a malformed PDF.
+- **PDF dehyphenation** — wrapped compounds like `well-\nknown` are kept as
+  `well-known` (the hyphenation regex captured single characters, so the
+  compound dictionary never matched).
+- **`BOOK_SKILL_WORKDIR` trailing space** — values from shells like
+  `cmd.exe` (`set VAR=value && …`) are stripped to avoid a path that breaks
+  `exists()`/`iterdir()` consistency on Windows (WinError 3).
+
 ## [1.3.0] - 2026-07-30
 
 ### Added
