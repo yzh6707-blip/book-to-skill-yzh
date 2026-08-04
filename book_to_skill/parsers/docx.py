@@ -5,17 +5,56 @@ import sys
 from book_to_skill.exceptions import ExtractionError
 
 
+_DOCX_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def _walk_document_blocks(root) -> list[str]:
+    """Emit paragraphs and tab-joined table rows in true document order.
+
+    Works on any element exposing an ``iter``/``tag`` API compatible with both
+    ``xml.etree.ElementTree`` and lxml (python-docx's backend), so the two
+    extraction paths share one ordering implementation.
+
+    Unknown wrappers (e.g. ``<w:sdt>`` content controls) are recursed into so
+    their paragraphs/tables are not lost; ``<w:p>`` and ``<w:tbl>`` are NOT
+    recursed into, so table-cell paragraphs are not double-counted. Cell text
+    concatenates the cell's runs; nested tables fold into the parent cell and
+    are also emitted standalone (rare; best-effort).
+    """
+    parts: list[str] = []
+
+    def emit_block(elem) -> None:
+        for child in elem:
+            tag = child.tag
+            if tag == f"{_DOCX_NS}p":
+                texts = [t.text for t in child.iter(f"{_DOCX_NS}t") if t.text]
+                if texts:
+                    parts.append("".join(texts))
+            elif tag == f"{_DOCX_NS}tbl":
+                for row in child.iter(f"{_DOCX_NS}tr"):
+                    cells = []
+                    for cell in row.iter(f"{_DOCX_NS}tc"):
+                        cell_texts = [t.text for t in cell.iter(f"{_DOCX_NS}t") if t.text]
+                        cells.append("".join(cell_texts).strip())
+                    if any(cells):
+                        parts.append("\t".join(cells))
+            else:
+                emit_block(child)
+
+    emit_block(root)
+    return parts
+
+
 def extract_docx_with_python_docx(docx_path: str) -> str | None:
     try:
         import docx
         document = docx.Document(docx_path)
-        parts = [paragraph.text for paragraph in document.paragraphs if paragraph.text]
-        for table in document.tables:
-            for row in table.rows:
-                cells = [cell.text.strip() for cell in row.cells]
-                if any(cells):
-                    parts.append("\t".join(cells))
-        return "\n".join(parts)
+        # python-docx's public API separates paragraphs and tables (tables all
+        # appended after paragraphs). Walk the body XML in document order so a
+        # table sandwiched between paragraphs keeps its position — matching the
+        # stdlib fallback's behavior.
+        parts = _walk_document_blocks(document.element.body)
+        return "\n".join(parts) if parts else None
     except ImportError:
         return None
     except Exception as e:
@@ -30,38 +69,7 @@ def extract_docx_with_zipfile(docx_path: str) -> str | None:
         with zipfile.ZipFile(docx_path) as zf:
             xml_bytes = zf.read("word/document.xml")
         root = ET.fromstring(xml_bytes)
-        ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-        parts: list[str] = []
-
-        def emit_block(elem) -> None:
-            # Walk block content in document order. Paragraphs join their runs;
-            # tables emit one tab-joined line per row (same row format as the
-            # python-docx path, but order-preserving — python-docx appends all
-            # tables last). Unknown wrappers (e.g. <w:sdt> content controls) are
-            # recursed into so their paragraphs/tables are not lost; <w:p> and
-            # <w:tbl> are NOT recursed into, so table-cell paragraphs are not
-            # double-counted. Cell text concatenates the cell's runs; nested
-            # tables fold into the parent cell and are also emitted standalone
-            # (rare; best-effort).
-            for child in elem:
-                tag = child.tag
-                if tag == f"{ns}p":
-                    texts = [t.text for t in child.iter(f"{ns}t") if t.text]
-                    if texts:
-                        parts.append("".join(texts))
-                elif tag == f"{ns}tbl":
-                    for row in child.iter(f"{ns}tr"):
-                        cells = []
-                        for cell in row.iter(f"{ns}tc"):
-                            cell_texts = [t.text for t in cell.iter(f"{ns}t") if t.text]
-                            cells.append("".join(cell_texts).strip())
-                        if any(cells):
-                            parts.append("\t".join(cells))
-                else:
-                    emit_block(child)
-
-        body = root.find(f"{ns}body")
-        emit_block(body if body is not None else root)
+        parts = _walk_document_blocks(root)
         return "\n".join(parts) if parts else None
     except Exception as e:
         print(f"  [warn] extract_docx_with_zipfile failed: {type(e).__name__}: {e}", file=sys.stderr)
