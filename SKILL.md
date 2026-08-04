@@ -116,6 +116,11 @@ Store the answer as `BOOK_TYPE`:
 - Option 2 → `BOOK_TYPE=text`
 - Option 3 → `BOOK_TYPE=text`
 
+**Non-interactive / batch runs:** if `BOOK_SKILL_ASSUME` is set to `technical` or
+`text`, skip the question entirely and use that value for `BOOK_TYPE` (defaults
+to `text`). This lets CI and scripted pipelines run the whole flow with no
+prompts: `BOOK_SKILL_ASSUME=technical BOOK_SKILL_NO_PROMPT=1 ...`.
+
 **If `BOOK_TYPE=technical`**, inform the user before proceeding:
 > "📐 Technical mode selected — using Docling for structure-aware extraction (tables, code blocks, formulas preserved as markdown). This takes ~1.5s per page, so expect a few minutes for longer sources. Starting now…"
 
@@ -166,6 +171,14 @@ Before extraction, the script checks optional Python packages needed for the det
 This creates:
 - `<tempdir>/book_skill_work/full_text.txt` — combined extracted text of all sources with clear visually demarcated boundaries.
 - `<tempdir>/book_skill_work/metadata.json` — overall combined size, words, pages, token counts, and a detailed list of individual processed `sources`.
+- `<tempdir>/book_skill_work/cache/` — per-source extraction cache keyed by content SHA-256.
+
+**Extraction is cached by content hash.** Re-running the extractor on the same
+files skips unchanged sources entirely (the slow part — PDF/docling/OCR — is
+not repeated). This matters most for the **Update / Fold-in** workflow: only
+new or changed files are re-parsed. Use `--no-cache` to force a full
+re-extraction, and check `file_sha256` per source in `metadata.json` to confirm
+what was hashed.
 
 Read `<tempdir>/book_skill_work/metadata.json` to inspect the results.
 
@@ -205,6 +218,10 @@ Read `<tempdir>/book_skill_work/metadata.json` and present the user with an esti
 
 Wait for the user to confirm before proceeding. If they say "analyze only", switch to Mode 2.
 
+**Non-interactive / batch runs:** if `BOOK_SKILL_NO_PROMPT=1` is set, print the
+estimate and proceed without waiting (the user opted in via the env var). Never
+prompt-and-block in this mode.
+
 ---
 
 ## Step 2.6 — REPL-style access for large books (> 50k tokens)
@@ -232,6 +249,23 @@ grep -c -i "westrum\|dora" "$FULL_TEXT_PATH"
 
 Use this approach for Step 3 (structure analysis), Step 7 (per-chapter summaries), and Step 8 (glossary / patterns extraction). On books under 50k tokens, a single `Read` is fine.
 
+**Cross-platform note:** the commands above are Unix tools (`wc`, `grep`, `sed`).
+On Windows hosts (Claude Code / Copilot on PowerShell, no Git Bash) they may not
+exist — use the built-in `probe` subcommand instead, which prints the same
+information (counts, detected chapter boundaries with line numbers, and the
+text of a single chapter):
+
+```bash
+"$PYTHON_BIN" "$SCRIPT_PATH" probe "$FULL_TEXT_PATH"                  # counts + chapter map
+"$PYTHON_BIN" "$SCRIPT_PATH" probe "$FULL_TEXT_PATH" --chapter 3      # just chapter 3's text
+"$PYTHON_BIN" "$SCRIPT_PATH" probe "$FULL_TEXT_PATH" --mode technical # extract then probe
+```
+
+`probe` accepts a source document (it extracts on the fly) or an
+already-extracted file such as `full_text.txt`. Whichever tool you use, the
+goal is identical: **pull only the slice you need — never re-read the whole
+file once per chapter.**
+
 Why this matters: a 200-page book is ~75k tokens. Re-reading it once per chapter (28 passes) costs ~2M input tokens; using grep + sed to pull only relevant slices keeps generation cost proportional to the output, not the source.
 
 ---
@@ -245,6 +279,23 @@ Read the first 8,000 characters of the extracted `full_text.txt` to identify:
 - Approximate number of chapters
 
 Then read the Table of Contents section if present to map all chapters.
+
+**If the first 8,000 characters do not clearly contain the title/author** — the
+front matter may be dominated by a foreword, a dedication, or publisher boilerplate —
+do **not** guess: scan the whole file for the title page instead. Grep for lines
+that are short, capitalized, and near the head of the file (the title page is
+typically the first 3–8 non-empty lines; check for an "Author" / "By" line):
+
+```bash
+# Title page: first ~10 non-blank lines
+grep -n -v '^\s*$' "$FULL_TEXT_PATH" | head -12
+# An "Author:" / "By <Name>" line anywhere in the head
+grep -n -i -m 5 -E '^\s*(author|by|editors?)\b' "$FULL_TEXT_PATH" | head -5
+```
+
+`metadata.json` already reports the detected chapter count (`chapters_detected`)
+and whether a ToC was found (`has_toc`) — trust it over re-deriving the structure
+by eye.
 
 **If mode is "Analyze Only":** produce the extraction report now and stop. Structure:
 ```
@@ -288,6 +339,9 @@ Use the answer to weight what gets highlighted in the SKILL.md Core section.
 - Answer includes option 1, 2, or 4 → `DEPTH=study` — deeper chapters with more worked detail, examples, and reasoning.
 
 `DEPTH` and `BOOK_TYPE` together set the per-chapter token budget in Step 7. Do **not** ask a separate "study vs reference" question — it is inferred here. (In Modes 2/3, where Step 4 is skipped, default `DEPTH=study`.)
+
+**Non-interactive / batch runs:** if `BOOK_SKILL_ASSUME_DEPTH` is set to `study`
+or `reference`, skip the question and use that depth directly.
 
 ---
 
@@ -518,16 +572,24 @@ or ask the agent directly.
 
 ---
 
-## Step 9.5 — Scan the generated skill
+## Step 9.5 — Validate and scan the generated skill
 
-Before reporting success, loading the skill in another session, or publishing it, run the advisory security scan:
+Before reporting success, loading the skill in another session, or publishing it, run **both** checks in order. Each exits non-zero on failure — stop there, fix the underlying issue, and do not load or publish the skill until both pass.
 
 ```bash
 SKILL_CONVERTER_ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+
+# 1) Structural validation: frontmatter, chapter-index links, required chapter
+#    headings, token budgets, and grounding of bolded terms against the source.
+#    Pass --full-text to the extractor's full_text.txt to enable grounding.
+"$PYTHON_BIN" "$SKILL_CONVERTER_ROOT/tools/validate_generated.py" \
+    "$SKILLS_HOME/<skill_name>" --full-text "<tempdir>/book_skill_work/full_text.txt"
+
+# 2) Advisory security scan: prompt-injection / authority patterns.
 "$PYTHON_BIN" "$SKILL_CONVERTER_ROOT/tools/scan_generated_skill.py" "$SKILLS_HOME/<skill_name>"
 ```
 
-If the scanner exits non-zero, stop and ask a human to review its file/line findings. Do not silently rewrite the generated files, and do not load or publish the skill until the findings are resolved or explicitly accepted.
+**ERRORs are hard failures** — fix them (e.g. a broken chapter link, a chapter missing `## Core Idea`, a missing `name`/`description`). **WARNings are advisory** (e.g. a bolded term not found verbatim in the source may be a synthesized framework name or an intentional rewrite — review, then accept or correct). Do not silently rewrite the generated files to silence a warning without understanding it; do not load or publish the skill until the findings are resolved or explicitly accepted.
 
 ---
 
@@ -589,6 +651,13 @@ Share this skill (Copilot ecosystem, optional):
 ## Update / Fold-in Workflow
 
 When performing an Update/Fold-in operation on an existing skill at `$SKILLS_HOME/<skill_name>/`:
+
+The extractor caches per-source results by content SHA-256 (Step 2): re-running
+it on the same work directory re-parses **only new or changed files**. If you
+are folding in a few new chapters of an existing book, you can re-run Step 2
+with the same `BOOK_SKILL_WORKDIR` and the untouched files will be reused from
+`cache/` instead of being extracted again. Add `--no-cache` if you want a full
+re-extraction.
 
 ### 1. Read Existing Skill Structure
 Read and parse the existing skill's files:

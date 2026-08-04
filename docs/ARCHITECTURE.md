@@ -69,6 +69,7 @@ document into clean text + metadata; the agent turns that into a structured skil
 | `book_to_skill/sanitize.py` | strips zero-width / Unicode-tag-block characters from extracted text (see Security) |
 | `tools/discovery_tax.py` | measures token cost vs context-dump / discovery loop |
 | `tools/validate_skill.py` | checks a generated SKILL.md against host rules (`--lens claude\|copilot\|amp`) |
+| `tools/validate_generated.py` | structural gate on generated skills: frontmatter, chapter-index links, required headings, token budgets, grounding of bolded terms against the source text (Step 9.5) |
 | `tools/scan_generated_skill.py` | advisory prompt-injection scan of a generated skill (see Security) |
 | `SKILL.md` | the generator spec (Steps 0–10 + fold-in workflow) |
 

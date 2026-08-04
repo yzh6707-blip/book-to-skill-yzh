@@ -401,7 +401,13 @@ for that).
 pip install "book-to-skill[pdf,epub,docx]"   # engine + optional extractors
 book-to-skill ~/path/to/book.pdf --mode text  # or: python -m book_to_skill ...
 book-to-skill --check                          # report which extractors are installed
+book-to-skill probe book.pdf --chapter 3       # cross-platform wc/grep/sed: counts, chapter map, one chapter
+book-to-skill book.pdf --no-cache              # force re-extraction (default: content-hash cache)
 ```
+
+Extraction is **cached by content SHA-256** (`<workdir>/cache/`): re-running on
+unchanged sources skips parsing entirely — useful for the Update/Fold-in flow
+and for slow PDF/docling/OCR extraction. `--no-cache` forces a full pass.
 
 ---
 
@@ -419,8 +425,10 @@ book-to-skill/
 │       ├── utils.py      # CLI parsing, multi-source resolution, chapter detection, runner
 │       └── parsers/      # Format-specific parsers (pdf, epub, docx, html, rtf, calibre, text)
 ├── tools/
-│   ├── discovery_tax.py  # measures token cost vs context-dump / discovery loop
-│   └── validate_skill.py # checks a generated SKILL.md against host rules (--lens claude|copilot|amp)
+│   ├── discovery_tax.py       # measures token cost vs context-dump / discovery loop
+│   ├── validate_skill.py      # checks a generated SKILL.md against host rules (--lens claude|copilot|amp)
+│   ├── validate_generated.py  # structural gate: links, headings, budgets, grounding
+│   └── scan_generated_skill.py# advisory prompt-injection scan of a generated skill
 ├── tests/                # pytest suite (extraction, detection, discovery tax)
 ├── docs/
 │   ├── PERFORMANCE.md    # measured benchmarks, discovery tax, cost
