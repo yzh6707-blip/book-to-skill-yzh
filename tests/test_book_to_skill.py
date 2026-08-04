@@ -8,9 +8,12 @@ Covers:
   Nit   — Glob results filtered by SUPPORTED_EXTENSIONS
 """
 
+import concurrent.futures as concurrent_futures
 import json
+import os
 import sys
 import textwrap
+import types
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -31,6 +34,14 @@ from book_to_skill.utils import (
     estimate_tokens,
     detect_structure,
     _cn_numeral_to_int,
+    _should_try_ocr,
+    _acquire_workdir_lock,
+    _release_workdir_lock,
+    _clean_workdir_stale_files,
+    _file_sha256,
+    _load_cache,
+    _save_cache,
+    probe_command,
     main,
 )
 from book_to_skill.config import SUPPORTED_EXTENSIONS
@@ -214,6 +225,99 @@ class TestEpubExtractionFix:
                 pytest.fail(f"Tuple-unpack regression! Got: {exc}")
 
         assert result["text"]  # some text was extracted
+
+    def test_ebooklib_respects_spine_order_not_manifest_order(self, tmp_path, monkeypatch):
+        """extract_with_ebooklib must follow OPF spine order, not manifest order.
+
+        The regression: ebooklib's get_items_of_type() iterates the manifest,
+        so a publisher listing chapters out of order produced scrambled text —
+        while the stdlib zipfile fallback was correct. Both paths must agree.
+        """
+        opf = (
+            '<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><manifest>'
+            '<item id="c2" href="ch2.xhtml" media-type="application/xhtml+xml"/>'
+            '<item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/>'
+            '</manifest><spine><itemref idref="c1"/><itemref idref="c2"/></spine></package>'
+        )
+        epub_path = tmp_path / "book.epub"
+        with zipfile.ZipFile(epub_path, "w") as zf:
+            zf.writestr("mimetype", "application/epub+zip")
+            zf.writestr("content.opf", opf)
+            zf.writestr("ch1.xhtml", "<html><body><p>FIRST</p></body></html>")
+            zf.writestr("ch2.xhtml", "<html><body><p>SECOND</p></body></html>")
+
+        # --- Fake ebooklib + bs4 so the spine logic runs without the deps ---
+        fake_ebooklib = types.ModuleType("ebooklib")
+        fake_ebooklib.ITEM_DOCUMENT = "ITEM_DOCUMENT"
+
+        class _FakeItem:
+            def __init__(self, name: str, content: bytes):
+                self._name = name
+                self._content = content
+
+            def get_name(self) -> str:
+                return self._name
+
+            def get_content(self) -> bytes:
+                return self._content
+
+        class _FakeBook:
+            def get_items_of_type(self, _t):
+                # Manifest order deliberately differs from spine order.
+                return [
+                    _FakeItem("ch2.xhtml", b"<html><body><p>SECOND</p></body></html>"),
+                    _FakeItem("ch1.xhtml", b"<html><body><p>FIRST</p></body></html>"),
+                ]
+
+        fake_epub = types.ModuleType("ebooklib.epub")
+        fake_epub.read_epub = lambda _path: _FakeBook()
+        fake_ebooklib.epub = fake_epub
+
+        import re
+
+        class _FakeSoup:
+            def __init__(self, content, _parser):
+                raw = content.decode("utf-8") if isinstance(content, bytes) else content
+                self._text = re.sub(r"<[^>]+>", "", raw)
+
+            def get_text(self, separator=" "):
+                return self._text
+
+        fake_bs4 = types.ModuleType("bs4")
+        fake_bs4.BeautifulSoup = _FakeSoup
+
+        monkeypatch.setitem(sys.modules, "ebooklib", fake_ebooklib)
+        monkeypatch.setitem(sys.modules, "ebooklib.epub", fake_epub)
+        monkeypatch.setitem(sys.modules, "bs4", fake_bs4)
+
+        from book_to_skill.parsers.epub import extract_with_ebooklib
+
+        text = extract_with_ebooklib(str(epub_path))
+        assert text is not None
+        assert text.index("FIRST") < text.index("SECOND")
+
+    def test_parse_spine_hrefs_resolves_oebps(self, tmp_path):
+        """_parse_spine_hrefs returns manifest hrefs in spine order, OPF-relative."""
+        from book_to_skill.parsers.epub import _parse_spine_hrefs
+
+        epub_path = _make_oebps_epub(tmp_path / "spine.epub")
+        hrefs = _parse_spine_hrefs(str(epub_path))
+
+        assert hrefs == [
+            "OEBPS/sections/ch1.xhtml",
+            "OEBPS/sections/ch2.xhtml",
+        ]
+
+    def test_parse_spine_hrefs_empty_without_opf(self, tmp_path):
+        """A zip with no OPF yields no spine hrefs (caller falls back to sorted)."""
+        from book_to_skill.parsers.epub import _parse_spine_hrefs
+
+        p = tmp_path / "noopf.epub"
+        with zipfile.ZipFile(p, "w") as zf:
+            zf.writestr("mimetype", "application/epub+zip")
+            zf.writestr("a.xhtml", "<html><body><p>AAA</p></body></html>")
+
+        assert _parse_spine_hrefs(str(p)) == []
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -581,6 +685,121 @@ class TestEstimateTokens:
         tokens = estimate_tokens(text)
         # 100 words / 0.75 ≈ 133
         assert tokens == 133
+
+    def test_cjk_text_estimated_by_characters(self):
+        # Predominantly Chinese text must not be estimated by word count (the
+        # old heuristic under-counted CJK by 3-4x).
+        cjk_text = "机器学习是人工智能的一个分支。" * 10  # 150 CJK chars
+        tokens = estimate_tokens(cjk_text)
+
+        assert tokens == int(len(cjk_text) / 1.5)
+
+    def test_latin_text_unaffected_by_cjk_change(self):
+        text = "hello world " * 50  # 100 words
+        assert estimate_tokens(text) == 133
+
+    def test_cjk_dominant_mixed_text(self):
+        mixed = "中文" * 100 + " some english words here "
+        # 200 CJK chars out of ~226 total (> 30%) -> character-based estimate
+        tokens = estimate_tokens(mixed)
+
+        assert tokens == int(len(mixed) / 1.5)
+
+    def test_korean_and_japanese_counted_as_cjk(self):
+        korean = "한국어 책의 내용입니다. " * 30
+        japanese = "日本語の本の内容です。" * 30
+        korean_tokens = estimate_tokens(korean)
+        japanese_tokens = estimate_tokens(japanese)
+
+        assert korean_tokens == int(len(korean) / 1.5)
+        assert japanese_tokens == int(len(japanese) / 1.5)
+
+
+class TestOcrPolicy:
+    """_should_try_ocr: thin text layers trigger OCR; env vars override."""
+
+    def test_empty_text_triggers_ocr(self):
+        assert _should_try_ocr("", 100) is True
+        assert _should_try_ocr("   \n  ", 100) is True
+
+    def test_thin_text_layer_triggers_ocr(self):
+        # 300 pages with only 3 chars/page average -> almost certainly a scan.
+        assert _should_try_ocr("x" * 900, 300) is True
+
+    def test_normal_text_layer_skips_ocr(self):
+        # 50 chars/page average is a legitimate (diagram-light) text PDF.
+        assert _should_try_ocr("x" * 5000, 100) is False
+
+    def test_unknown_page_count_skips_ocr(self):
+        # Can't compute an average without a page count; don't guess.
+        assert _should_try_ocr("x" * 50, 0) is False
+
+    def test_force_ocr_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("BOOK_SKILL_FORCE_OCR", "1")
+        assert _should_try_ocr("x" * 100000, 100) is True
+
+    def test_no_ocr_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("BOOK_SKILL_NO_OCR", "1")
+        assert _should_try_ocr("", 100) is False
+        assert _should_try_ocr("x" * 10, 100) is False
+
+    def test_threshold_env_tunable(self, monkeypatch):
+        monkeypatch.setenv("BOOK_SKILL_OCR_THRESHOLD", "100")
+        # 50 chars/page < threshold 100 -> OCR now triggers.
+        assert _should_try_ocr("x" * 5000, 100) is True
+
+
+class TestWorkdirLock:
+    """Concurrent runs must not clobber the shared work directory."""
+
+    def test_stale_lock_is_reclaimed(self, tmp_path, monkeypatch):
+        out_dir = tmp_path / "output"
+        monkeypatch.setattr("book_to_skill.utils.OUTPUT_DIR", out_dir)
+        lock_file = out_dir.parent / "output.lock"
+        # A PID that cannot be alive (max typical PID).
+        lock_file.write_text("99999999", encoding="utf-8")
+
+        lock = _acquire_workdir_lock()
+
+        assert lock is not None
+        assert lock.exists()
+        _release_workdir_lock(lock)
+        assert not lock_file.exists()
+
+    def test_live_lock_blocks_second_instance(self, tmp_path, monkeypatch):
+        out_dir = tmp_path / "output"
+        monkeypatch.setattr("book_to_skill.utils.OUTPUT_DIR", out_dir)
+        lock_file = out_dir.parent / "output.lock"
+        # Simulate another live instance by writing this test process's PID.
+        lock_file.write_text(str(os.getpid()), encoding="utf-8")
+
+        assert _acquire_workdir_lock() is None
+
+    def test_lock_release_allows_reacquire(self, tmp_path, monkeypatch):
+        out_dir = tmp_path / "output"
+        monkeypatch.setattr("book_to_skill.utils.OUTPUT_DIR", out_dir)
+
+        first = _acquire_workdir_lock()
+        assert first is not None
+        _release_workdir_lock(first)
+
+        second = _acquire_workdir_lock()
+        assert second is not None
+        _release_workdir_lock(second)
+
+    def test_clean_stale_files_removes_leftovers(self, tmp_path, monkeypatch):
+        out_dir = tmp_path / "output"
+        out_dir.mkdir()
+        (out_dir / "full_text.txt").write_text("stale", encoding="utf-8")
+        (out_dir / "subdir").mkdir()
+        (out_dir / "subdir" / "x.txt").write_text("x", encoding="utf-8")
+        monkeypatch.setattr("book_to_skill.utils.OUTPUT_DIR", out_dir)
+
+        _clean_workdir_stale_files()
+
+        assert not (out_dir / "full_text.txt").exists()
+        assert not (out_dir / "subdir").exists()
+        assert out_dir.exists()
 
 
 class TestDetectStructure:
@@ -1483,6 +1702,21 @@ class TestPdftotextCleanup:
         assert "Title" in out
         assert "1" in out
 
+    def test_hyphenated_compound_preserved(self):
+        # "well-\nknown" is a real hyphenated word — must stay hyphenated,
+        # not become "wellknown".
+        raw = self._pages(*(f"H\nThis is well-\nknown text\n{n}" for n in (1, 2, 3)))
+        out = pdf_parser.clean_pdftotext(raw)
+        assert "well-known" in out
+        assert "wellknown" not in out
+
+    def test_regular_word_still_dehyphenates(self):
+        # "informa-\ntion" is a line wrap, not a compound — must merge.
+        raw = self._pages(*(f"H\ninforma-\ntion\n{n}" for n in (1, 2, 3)))
+        out = pdf_parser.clean_pdftotext(raw)
+        assert "information" in out
+        assert "informa-" not in out
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Fix #4 — Lowercase Roman numeral chapter detection
@@ -1570,3 +1804,286 @@ class TestParseArgumentsUnknownFlags:
         parse_arguments(["extract.py", "book.pdf", "notes.txt"])
         captured = capsys.readouterr()
         assert captured.err == ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  P0-4 — pdfminer in-process extraction must have a deadline
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPdfminerTimeout:
+    """A pathological PDF must not hang the CLI; timeout is handled gracefully.
+
+    The timeout branch is exercised with a *stubbed* executor/future: spawning a
+    real ThreadPoolExecutor inside the pytest process on Windows/Python 3.12
+    trips an interpreter-shutdown race (KeyboardInterrupt raised in
+    ``Thread.start()``), which aborts the whole run. The production code's
+    ``future.result(timeout=...)`` / ``except TimeoutError`` contract is what
+    matters, and that is fully covered without creating any real threads.
+    """
+
+    def _install_fake_pdfminer(self, monkeypatch, extract_text):
+        fake_hl = types.ModuleType("pdfminer.high_level")
+        fake_hl.extract_text = extract_text
+        fake_pdfminer = types.ModuleType("pdfminer")
+        fake_pdfminer.high_level = fake_hl
+        monkeypatch.setitem(sys.modules, "pdfminer", fake_pdfminer)
+        monkeypatch.setitem(sys.modules, "pdfminer.high_level", fake_hl)
+        return fake_pdfminer
+
+    def _stub_executor(self, monkeypatch, future):
+        class FakeExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def submit(self, _fn, *args, **kwargs):
+                return future
+
+            def shutdown(self, wait=True):
+                pass
+
+        # pdf.py uses `concurrent.futures.ThreadPoolExecutor`, so patch the
+        # shared module attribute (monkeypatch restores it afterwards).
+        monkeypatch.setattr(concurrent_futures, "ThreadPoolExecutor", FakeExecutor)
+
+    def test_pdfminer_timeout_error_returns_none(self, tmp_path, monkeypatch):
+        class _TimedOutFuture:
+            def result(self, timeout=None):
+                raise concurrent_futures.TimeoutError("simulated pdfminer hang")
+
+        self._install_fake_pdfminer(monkeypatch, lambda path: "unused")
+        self._stub_executor(monkeypatch, _TimedOutFuture())
+
+        result = pdf_parser.extract_with_pdfminer("path.pdf")
+
+        assert result is None
+
+    def test_pdfminer_success_path_unchanged(self, tmp_path, monkeypatch):
+        class _ImmediateFuture:
+            def result(self, timeout=None):
+                return "pdfminer text"
+
+        self._install_fake_pdfminer(monkeypatch, lambda path: "unused")
+        self._stub_executor(monkeypatch, _ImmediateFuture())
+
+        result = pdf_parser.extract_with_pdfminer("path.pdf")
+
+        assert result == "pdfminer text"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  P1-2 — python-docx path must preserve document order (tables in place)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPythonDocxDocumentOrder:
+    """The python-docx extraction path must not move tables to the end."""
+
+    def test_python_docx_keeps_table_between_paragraphs(self, monkeypatch):
+        import xml.etree.ElementTree as ET
+
+        ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        body = ET.fromstring(
+            f'<w:body xmlns:w="{ns}">'
+            '<w:p><w:r><w:t>Before</w:t></w:r></w:p>'
+            '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>R1C1</w:t></w:r></w:p></w:tc>'
+            '<w:tc><w:p><w:r><w:t>R1C2</w:t></w:r></w:p></w:tc></w:tr></w:tbl>'
+            '<w:p><w:r><w:t>After</w:t></w:r></w:p>'
+            "</w:body>"
+        )
+
+        class _FakeDocument:
+            def __init__(self, _path):
+                self.element = types.SimpleNamespace(body=body)
+
+        fake_docx = types.ModuleType("docx")
+        fake_docx.Document = _FakeDocument
+        monkeypatch.setitem(sys.modules, "docx", fake_docx)
+
+        from book_to_skill.parsers.docx import extract_docx_with_python_docx
+
+        out = extract_docx_with_python_docx("irrelevant.docx")
+
+        assert out == "Before\nR1C1\tR1C2\nAfter"
+
+    def test_python_docx_paragraph_only_unchanged(self, monkeypatch):
+        import xml.etree.ElementTree as ET
+
+        ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        body = ET.fromstring(
+            f'<w:body xmlns:w="{ns}">'
+            '<w:p><w:r><w:t>Just a paragraph</w:t></w:r></w:p>'
+            '<w:p><w:r><w:t>And another</w:t></w:r></w:p>'
+            "</w:body>"
+        )
+
+        class _FakeDocument:
+            def __init__(self, _path):
+                self.element = types.SimpleNamespace(body=body)
+
+        fake_docx = types.ModuleType("docx")
+        fake_docx.Document = _FakeDocument
+        monkeypatch.setitem(sys.modules, "docx", fake_docx)
+
+        from book_to_skill.parsers.docx import extract_docx_with_python_docx
+
+        out = extract_docx_with_python_docx("irrelevant.docx")
+
+        assert out == "Just a paragraph\nAnd another"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  P2 — content-hash extraction cache (unchanged sources are never re-parsed)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestExtractionCache:
+    """Re-running on unchanged sources must skip extraction entirely."""
+
+    def _run_main(self, tmp_path, monkeypatch, *extra_args):
+        source = tmp_path / "doc.txt"
+        source.write_text("Chapter content alpha.\n", encoding="utf-8")
+        out_dir = tmp_path / "output"
+        monkeypatch.setattr("book_to_skill.utils.OUTPUT_DIR", out_dir)
+        monkeypatch.setattr("book_to_skill.utils.OUTPUT_TEXT", out_dir / "full_text.txt")
+        monkeypatch.setattr("book_to_skill.utils.OUTPUT_META", out_dir / "metadata.json")
+        monkeypatch.setattr("book_to_skill.utils.prepare_dependencies", lambda *a: None)
+
+        calls = {"n": 0}
+        real_extract = extract_single_file
+
+        def counting_extract(*args, **kwargs):
+            calls["n"] += 1
+            return real_extract(*args, **kwargs)
+
+        monkeypatch.setattr("book_to_skill.utils.extract_single_file", counting_extract)
+        monkeypatch.setattr(
+            "sys.argv",
+            ["extract.py", str(source), *extra_args, "--install-missing", "no"],
+        )
+        return out_dir, calls
+
+    def test_unchanged_source_reused_from_cache(self, tmp_path, monkeypatch):
+        out_dir, calls = self._run_main(tmp_path, monkeypatch)
+
+        main()
+        assert calls["n"] == 1  # extracted on the first run
+
+        main()  # same workdir, same source content
+        assert calls["n"] == 1  # cache hit: extraction was skipped
+
+        meta = json.loads((out_dir / "metadata.json").read_text(encoding="utf-8"))
+        assert meta["sources"][0]["file_sha256"]
+        assert (out_dir / "cache").is_dir()
+
+    def test_cache_invalidated_when_source_changes(self, tmp_path, monkeypatch):
+        source = tmp_path / "doc.txt"
+        out_dir, calls = self._run_main(tmp_path, monkeypatch)
+
+        main()
+        assert calls["n"] == 1
+
+        source.write_text("Chapter content beta, changed.\n", encoding="utf-8")
+        main()
+        assert calls["n"] == 2  # content hash differs -> re-extract
+
+    def test_no_cache_forces_re_extraction(self, tmp_path, monkeypatch):
+        _, calls = self._run_main(tmp_path, monkeypatch, "--no-cache")
+
+        main()
+        assert calls["n"] == 1
+        main()
+        assert calls["n"] == 2  # --no-cache bypasses the cache on purpose
+
+    def test_clean_workdir_preserves_cache_dir(self, tmp_path, monkeypatch):
+        out_dir = tmp_path / "output"
+        cache = out_dir / "cache"
+        cache.mkdir(parents=True)
+        cached_file = cache / "deadbeef-text-doc.json"
+        cached_file.write_text("{}", encoding="utf-8")
+        (out_dir / "stale.txt").write_text("stale", encoding="utf-8")
+        monkeypatch.setattr("book_to_skill.utils.OUTPUT_DIR", out_dir)
+
+        _clean_workdir_stale_files()
+
+        assert cached_file.exists(), "cache/ must survive the stale-file cleanup"
+        assert not (out_dir / "stale.txt").exists()
+
+    def test_sha256_streams_binary_content(self, tmp_path):
+        blob = tmp_path / "blob.bin"
+        blob.write_bytes(b"\x00\x01binary\xff" * 1000)
+
+        assert _file_sha256(blob) == _file_sha256(blob)
+        assert len(_file_sha256(blob)) == 64
+
+    def test_cache_round_trip(self, tmp_path, monkeypatch):
+        out_dir = tmp_path / "output"
+        # Cache dir is derived from the *current* OUTPUT_DIR at call time.
+        monkeypatch.setattr("book_to_skill.utils.OUTPUT_DIR", out_dir)
+        # Direct function-level round trip (no main()):
+        sha = "a" * 64
+        result = {"text": "hello", "format": "txt", "filename": "doc.txt"}
+        _save_cache(sha, "doc.txt", "text", result)
+        loaded = _load_cache(sha, "doc.txt", "text")
+        assert loaded is not None and loaded["text"] == "hello"
+        assert (out_dir / "cache").is_dir()  # save created the cache dir
+
+        # Different mode or hash must not hit
+        assert _load_cache("b" * 64, "doc.txt", "text") is None
+        assert _load_cache(sha, "doc.txt", "technical") is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  P2 — probe subcommand (cross-platform wc/grep/sed replacement)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestProbeCommand:
+    def test_probe_reports_chapter_boundaries(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr("book_to_skill.utils.prepare_dependencies", lambda *a: None)
+        source = tmp_path / "doc.txt"
+        source.write_text(
+            "# Chapter 1: Intro\n\nBody one.\n\n# Chapter 2: Deep\n\nBody two.\n",
+            encoding="utf-8",
+        )
+
+        assert probe_command([str(source), "--mode", "text"]) == 0
+        out = capsys.readouterr().out
+
+        assert "Lines : 7" in out
+        assert "Chapters (detected): 2" in out
+        assert "Chapter 1: Intro" in out
+        assert "Chapter 2: Deep" in out
+
+    def test_probe_chapter_slice(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr("book_to_skill.utils.prepare_dependencies", lambda *a: None)
+        source = tmp_path / "doc.txt"
+        source.write_text(
+            "# Chapter 1: Intro\n\nBody one.\n\n# Chapter 2: Deep\n\nBody two.\n",
+            encoding="utf-8",
+        )
+
+        assert probe_command([str(source), "--chapter", "2"]) == 0
+        out = capsys.readouterr().out
+
+        assert "--- Chapter 2: # Chapter 2: Deep ---" in out
+        assert "Body two." in out
+        assert "Body one." not in out
+
+    def test_probe_missing_file(self, tmp_path, capsys):
+        assert probe_command([str(tmp_path / "nope.txt")]) == 1
+        assert "file not found" in capsys.readouterr().err
+
+    def test_probe_accepts_already_extracted_text(self, tmp_path, capsys):
+        text_file = tmp_path / "full_text.txt"
+        text_file.write_text("Some plain text without headings.\n", encoding="utf-8")
+
+        assert probe_command([str(text_file)]) == 0
+        out = capsys.readouterr().out
+
+        assert "Lines : 1" in out
+        assert "Chapters (detected): 0" in out
+
+    def test_probe_chapter_out_of_range(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr("book_to_skill.utils.prepare_dependencies", lambda *a: None)
+        source = tmp_path / "doc.txt"
+        source.write_text("# Chapter 1\n\nBody.\n", encoding="utf-8")
+
+        assert probe_command([str(source), "--chapter", "5"]) == 1
+        assert "out of range" in capsys.readouterr().err

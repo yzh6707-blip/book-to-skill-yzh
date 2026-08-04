@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -37,6 +39,7 @@ from book_to_skill.parsers.pdf import (
     extract_with_pdftotext,
     extract_with_pypdf,
     extract_with_pdfminer,
+    extract_with_ocr,
     count_pages,
 )
 from book_to_skill.parsers.epub import (
@@ -47,7 +50,65 @@ from book_to_skill.parsers.epub import (
 from book_to_skill.sanitize import sanitize_extracted_text
 
 
+# CJK scripts tokenize at roughly one token per character (or worse), unlike
+# whitespace-delimited Latin text at ~0.75 words/token. When a document is
+# predominantly CJK, the word-count heuristic under-counts by 3–4× and would
+# badly mislead the Step 2.5 cost estimate and the Step 2.6 "large book" probe.
+_CJK_RANGES = (
+    (0x3400, 0x4DBF),   # CJK Unified Ideographs Extension A
+    (0x4E00, 0x9FFF),   # CJK Unified Ideographs
+    (0x3040, 0x30FF),   # Hiragana + Katakana
+    (0xAC00, 0xD7AF),   # Hangul syllables
+    (0xF900, 0xFAFF),   # CJK Compatibility Ideographs
+)
+
+# Conservative CJK estimate: ~1.5 chars per token. Real encoders are closer to
+# 1:1 for pure CJK, but a doc is usually mixed, so this avoids over-correcting.
+_CJK_CHARS_PER_TOKEN = 1.5
+
+
+def _is_cjk_char(char: str) -> bool:
+    codepoint = ord(char)
+    return any(start <= codepoint <= end for start, end in _CJK_RANGES)
+
+
+def _should_try_ocr(text: str, pages: int) -> bool:
+    """Decide whether a PDF's text layer is thin enough to warrant OCR.
+
+    A scan with no embedded text extracts nothing, but a legitimate
+    diagram-heavy PDF may also have little text per page — so the heuristic is
+    per-page average characters, not a flat total. Overridable via env vars:
+
+      BOOK_SKILL_FORCE_OCR=1            always try OCR (even when text looks fine)
+      BOOK_SKILL_NO_OCR=1               never try OCR (rely on the text layer)
+      BOOK_SKILL_OCR_THRESHOLD=<N>      chars-per-page threshold (default 30)
+    """
+    force = os.environ.get("BOOK_SKILL_FORCE_OCR", "").lower() in {"1", "true", "yes", "y"}
+    if force:
+        return True
+    if os.environ.get("BOOK_SKILL_NO_OCR", "").lower() in {"1", "true", "yes", "y"}:
+        return False
+    if not text or not text.strip():
+        return True  # empty text layer: almost certainly a scan
+    if pages <= 0:
+        return False  # unknown page count: don't guess
+    threshold = float(os.environ.get("BOOK_SKILL_OCR_THRESHOLD", "30"))
+    avg_chars_per_page = len(text.strip()) / pages
+    return avg_chars_per_page < threshold
+
+
 def estimate_tokens(text: str) -> int:
+    """Estimate token count, CJK-aware.
+
+    Latin text is estimated at ``WORDS_PER_TOKEN`` words per token. If CJK
+    characters dominate (> 30% of the text), estimate by character count
+    instead, since word-splitting badly under-counts Chinese/Japanese/Korean.
+    """
+    if not text:
+        return 0
+    cjk_count = sum(1 for char in text if _is_cjk_char(char))
+    if cjk_count / len(text) > 0.3:
+        return int(len(text) / _CJK_CHARS_PER_TOKEN)
     return int(len(text.split()) / WORDS_PER_TOKEN)
 
 
@@ -345,6 +406,9 @@ def parse_arguments(argv: list[str]) -> tuple[list[str], str, str]:
                 i += 1
         elif arg == "--no-install-missing":
             i += 1
+        elif arg == "--no-cache":
+            # Consumed by main(); never treated as an unknown flag.
+            i += 1
         elif arg.startswith("-"):
             print(f"WARNING: Unknown flag '{arg}' — ignoring it.", file=sys.stderr)
             i += 1
@@ -517,17 +581,31 @@ def extract_single_file(input_path: Path, extraction_mode: str, install_mode: st
                         print("OK")
                     else:
                         print("FAILED")
-                        raise ExtractionError(
-                            "Could not extract text from PDF.\n"
-                            "Install one of: poppler-utils (pdftotext), pypdf, or pdfminer.six\n"
-                            "  sudo apt install poppler-utils\n"
-                            "  pip3 install pypdf\n"
-                            "  pip3 install pdfminer.six"
-                        )
 
-                        
         pages = count_pages(input_str)
         pages_label = "pages"
+
+        # Scanned-PDF salvage: a thin text layer (per-page average below the
+        # threshold) means this PDF is almost certainly a scan with no embedded
+        # text. Try OCR (tesseract + pdftoppm) before giving up, so scanned
+        # technical books and Chinese scanned books actually work. Threshold and
+        # behavior are overridable via BOOK_SKILL_FORCE_OCR / BOOK_SKILL_NO_OCR /
+        # BOOK_SKILL_OCR_THRESHOLD (see _should_try_ocr).
+        if _should_try_ocr(text, pages):
+            print("  [info] empty/near-empty text layer — trying OCR (tesseract + pdftoppm)...", end=" ", flush=True)
+            ocr_text = extract_with_ocr(input_str)
+            if ocr_text:
+                text = ocr_text
+                method = "ocr"
+                print("OK")
+            else:
+                print("not available")
+                if not text or not text.strip():
+                    raise ExtractionError(
+                        "Could not extract text from PDF — no text layer and OCR unavailable.\n"
+                        "Install poppler-utils (pdftotext) / pypdf / pdfminer.six, or for scanned\n"
+                        "PDFs install tesseract + pdftoppm."
+                    )
     elif ext in TEXT_EXTENSIONS:
         print(f"Extracting text document: {input_str}")
         text = read_text_file(input_str)
@@ -609,8 +687,222 @@ def print_banner() -> None:
         pass  # best-effort: never block extraction on the banner
 
 
+def _pid_is_alive(pid: str) -> bool:
+    """True if a process with this PID is running (signal-0 probe)."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _acquire_workdir_lock() -> Path | None:
+    """Best-effort exclusive lock for the shared work directory.
+
+    Two concurrent runs must not clobber each other's ``full_text.txt`` /
+    ``metadata.json``. Returns the lock-file path on success, or ``None`` when
+    another live instance holds it. A stale lock whose PID is dead is
+    reclaimed automatically.
+    """
+    try:
+        lock = OUTPUT_DIR.parent / f"{OUTPUT_DIR.name}.lock"
+        if lock.exists():
+            pid = lock.read_text(encoding="utf-8").strip()
+            if pid and _pid_is_alive(pid):
+                return None
+        lock.write_text(str(os.getpid()), encoding="utf-8")
+        return lock
+    except OSError:
+        # Locking is best-effort; a missing lock must not be the failure mode.
+        return None
+
+
+def _release_workdir_lock(lock: Path | None) -> None:
+    """Remove the lock file if we own it (never another instance's)."""
+    if lock is None:
+        return
+    try:
+        if lock.exists() and lock.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            lock.unlink()
+    except OSError:
+        pass
+
+
+def _clean_workdir_stale_files() -> None:
+    """Remove leftovers from a previous interrupted run.
+
+    The generator normally deletes the work directory after a run; if it was
+    interrupted, stale files must not leak into (or be confused with) the next
+    run. The lock file lives outside the directory and is never touched, and
+    the per-source extraction ``cache/`` is kept so unchanged sources (e.g. in
+    a fold-in update) can be reused instead of re-extracted.
+    """
+    if not OUTPUT_DIR.exists():
+        return
+    try:
+        entries = list(OUTPUT_DIR.iterdir())
+    except OSError:
+        # Paths with trailing whitespace (from shells) can make exists() report
+        # True while iterdir() fails with WinError 3 — never crash on that.
+        return
+    for item in entries:
+        if item.name == "cache" and item.is_dir():
+            continue  # keep the extraction cache across runs
+        try:
+            if item.is_dir():
+                shutil.rmtree(item, ignore_errors=True)
+            else:
+                item.unlink()
+        except OSError:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Content-hash extraction cache
+#
+#  Keyed by the source file's SHA-256, so an unchanged file is never re-parsed
+#  (PDF/docling/OCR extraction is the slow part of a book conversion; fold-in
+#  updates and re-runs skip it entirely). Disable with --no-cache.
+# ═══════════════════════════════════════════════════════════════════════════
+def _cache_dir() -> Path:
+    """Cache lives under the *current* work directory, resolved at call time."""
+    return OUTPUT_DIR / "cache"
+
+
+def _file_sha256(path: Path) -> str:
+    """Content hash of a source file (streamed, so it handles big PDFs)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _cache_path(sha256: str, filename: str, extraction_mode: str) -> Path:
+    return _cache_dir() / f"{sha256[:16]}-{extraction_mode}-{Path(filename).name}.json"
+
+
+def _load_cache(sha256: str, filename: str, extraction_mode: str) -> dict | None:
+    cache_file = _cache_path(sha256, filename, extraction_mode)
+    if not cache_file.is_file():
+        return None
+    try:
+        data = json.loads(cache_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or "text" not in data:
+        return None
+    return data
+
+
+def _save_cache(sha256: str, filename: str, extraction_mode: str, result: dict) -> None:
+    try:
+        _cache_dir().mkdir(parents=True, exist_ok=True)
+        payload = {key: value for key, value in result.items() if key != "file_sha256"}
+        _cache_path(sha256, filename, extraction_mode).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass  # caching is best-effort; never fail extraction on it
+
+
+def _is_heading_line(line: str) -> bool:
+    """Best-effort chapter-heading detector for `probe` line numbering.
+
+    Reuses the structure-detection regexes so the reported boundaries match
+    what detect_structure() would find, plus Markdown headings and plain
+    "Chapter/Part N" lines. Advisory only — the generator does the real
+    chapter mapping in Step 3/7.
+    """
+    if re.match(r"^\s*#{1,6}\s+\S", line):
+        return True
+    for pattern in (_CN_CHAPTER, _TH_CHAPTER, _KO_CHAPTER, _ROMAN_HEAD, _LC_MD_ROMAN):
+        if pattern.match(line):
+            return True
+    if re.match(r"^\s*(?:chapter|chapters|part|section|lesson)\s+\d+", line, re.IGNORECASE):
+        return True
+    return False
+
+
+def probe_command(argv: list[str]) -> int:
+    """Inspect a document without generating a skill.
+
+    A cross-platform (Windows/PowerShell-friendly) replacement for the
+    wc/grep/sed pipeline in SKILL.md Step 2.6:
+
+        python -m book_to_skill probe <file> [--mode technical|text] [--chapter N]
+
+    Prints line/word/token counts, detected chapter boundaries with line
+    numbers, and (with --chapter) the text of one chapter. The path may be a
+    source document (extracted on the fly) or an already-extracted file such
+    as full_text.txt.
+    """
+    parser = argparse.ArgumentParser(
+        prog="book_to_skill probe",
+        description="Inspect a document: counts, chapter boundaries, one chapter.",
+    )
+    parser.add_argument("path", help="Source document or already-extracted text")
+    parser.add_argument("--mode", choices=("technical", "text"), default="text")
+    parser.add_argument(
+        "--chapter", type=int, default=None, help="Print the text of chapter N"
+    )
+    args = parser.parse_args(argv)
+
+    path = Path(args.path)
+    if not path.is_file():
+        print(f"ERROR: file not found: {path}", file=sys.stderr)
+        return 1
+
+    if path.suffix.lower() in SUPPORTED_EXTENSIONS:
+        try:
+            res = extract_single_file(path, args.mode, "no")
+        except ExtractionError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        text = res["text"]
+        details = (
+            f"format={res['format']} extraction={res['extraction_method']} "
+            f"pages={res['pages']} chars={res['chars']} tokens=~{res['estimated_tokens']}"
+        )
+    else:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        details = f"chars={len(text)} tokens=~{estimate_tokens(text)}"
+
+    lines = text.splitlines()
+    print(f"File: {path}")
+    print(f"  Lines : {len(lines)}")
+    print(f"  Words : {len(text.split())}")
+    print(f"  {details}")
+
+    boundaries: list[tuple[int, str]] = []
+    for index, line in enumerate(lines, 1):
+        if _is_heading_line(line):
+            boundaries.append((index, line.strip()))
+    print(f"  Chapters (detected): {len(boundaries)}")
+    for index, title in boundaries[:40]:
+        print(f"    {index:>6}  {title}")
+    if len(boundaries) > 40:
+        print(f"    ... {len(boundaries) - 40} more")
+
+    if args.chapter is not None:
+        if not boundaries or args.chapter < 1 or args.chapter > len(boundaries):
+            print(
+                f"ERROR: chapter {args.chapter} out of range (1..{len(boundaries)})",
+                file=sys.stderr,
+            )
+            return 1
+        start = boundaries[args.chapter - 1][0] - 1
+        end = boundaries[args.chapter][0] - 1 if args.chapter < len(boundaries) else len(lines)
+        print(f"\n--- Chapter {args.chapter}: {boundaries[args.chapter - 1][1]} ---")
+        print("\n".join(lines[start:end]))
+    return 0
+
+
 def main():
     print_banner()
+
+    if len(sys.argv) > 1 and sys.argv[1] == "probe":
+        sys.exit(probe_command(sys.argv[2:]))
 
     if "--check" in sys.argv[1:]:
         sys.exit(run_dependency_check())
@@ -620,116 +912,151 @@ def main():
         print("       extract.py --check    # report which extractors are installed", file=sys.stderr)
         print(f"Supported formats: {supported_formats_message()}", file=sys.stderr)
         sys.exit(1)
-        
+
     raw_input_paths, extraction_mode, install_mode = parse_arguments(sys.argv)
-    
+
     if not raw_input_paths:
         print("ERROR: No input document, folder, or glob pattern specified.", file=sys.stderr)
         sys.exit(1)
-        
+
     input_files = resolve_input_files(raw_input_paths)
-    
+
     if not input_files:
         print(f"ERROR: No supported files found matching: {', '.join(raw_input_paths)}", file=sys.stderr)
         sys.exit(1)
-        
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    
-    extracted_sources = []
-    combined_texts = []
-    errors = []
-    
-    for file_path in input_files:
-        try:
-            res = extract_single_file(file_path, extraction_mode, install_mode)
-        except ExtractionError as exc:
-            print(f"WARNING: Skipping {file_path.name}: {exc}", file=sys.stderr)
-            errors.append((file_path, str(exc)))
-            continue
-        extracted_sources.append(res)
-        
-        # Format the text with a clear boundary
-        separator = f"\n\n{'=' * 80}\nSOURCE: {res['filename']} (Path: {res['source_file']})\n{'=' * 80}\n\n"
-        combined_texts.append(separator + res["text"])
-    
-    if not extracted_sources:
-        print(f"\nERROR: All {len(errors)} source(s) failed extraction:", file=sys.stderr)
-        for path, err in errors:
-            print(f"  - {path.name}: {err}", file=sys.stderr)
-        sys.exit(1)
-        
-    # Combine texts
-    consolidated_text = "".join(combined_texts).strip()
-    
-    # Write combined text
-    OUTPUT_TEXT.write_text(consolidated_text, encoding="utf-8")
-    
-    # Consolidate metadata
-    total_file_size_mb = sum(src["file_size_mb"] for src in extracted_sources)
-    total_pages = sum(src["pages"] for src in extracted_sources)
-    total_chars = len(consolidated_text)
-    total_words = len(consolidated_text.split())
-    total_tokens = estimate_tokens(consolidated_text)
-    
-    # Detect structure from source content only. The generated SOURCE banners in
-    # full_text.txt use rows of "=", which can otherwise become phantom setext
-    # headings and make the result depend on the source-path length.
-    structure_text = "\n\n".join(src["text"] for src in extracted_sources)
-    consolidated_structure = detect_structure(structure_text)
-    
-    metadata = {
-        "source_file": "Consolidated from multiple sources" if len(extracted_sources) > 1 else extracted_sources[0]["source_file"],
-        "filename": "multi-source" if len(extracted_sources) > 1 else extracted_sources[0]["filename"],
-        "format": "mixed" if len(extracted_sources) > 1 else extracted_sources[0]["format"],
-        "extraction_method": "multi-method" if len(extracted_sources) > 1 else extracted_sources[0]["extraction_method"],
-        "extraction_mode": extraction_mode,
-        "file_size_mb": round(total_file_size_mb, 2),
-        "pages": total_pages,
-        "chars": total_chars,
-        "words": total_words,
-        "estimated_tokens": total_tokens,
-        "estimated_tokens_human": f"~{total_tokens // 1000}K",
-        "output_text": str(OUTPUT_TEXT),
-        "total_sources": len(extracted_sources),
-        "sources": [
-            {
-                "source_file": src["source_file"],
-                "filename": src["filename"],
-                "format": src["format"],
-                "extraction_method": src["extraction_method"],
-                "file_size_mb": src["file_size_mb"],
-                "pages": src["pages"],
-                "pages_label": src["pages_label"],
-                "chars": src["chars"],
-                "words": src["words"],
-                "estimated_tokens": src["estimated_tokens"],
-                "chapters_detected": src["chapters_detected"],
-                "has_toc": src["has_toc"]
-            }
-            for src in extracted_sources
-        ],
-        **consolidated_structure,
-    }
-    
-    OUTPUT_META.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
-    
-    page_line = f"   Total Pages: {total_pages}"
-    print("\nExtraction complete:")
-    print(f"   Sources : {len(extracted_sources)} processed")
-    print(f"   Size    : {total_file_size_mb:.2f} MB")
-    print(page_line)
-    print(f"   Words   : {total_words:,}")
-    print(f"   Tokens  : ~{total_tokens // 1000}K")
-    print(f"   Chapters: {consolidated_structure['chapters_detected']} detected overall")
-    print(f"   ToC     : {'yes' if consolidated_structure['has_toc'] else 'not detected'}")
-    if not consolidated_structure["has_toc"]:
+
+    lock_path = _acquire_workdir_lock()
+    if lock_path is None:
         print(
-            "   WARN    : No table of contents detected — chapter mapping in Step 3 "
-            "will rely on heading scan only, which may miss or duplicate sections."
+            "ERROR: Another book-to-skill instance is using the work directory:\n"
+            f"       {OUTPUT_DIR}\n"
+            "Wait for it to finish, remove a stale lock file, or set BOOK_SKILL_WORKDIR "
+            "to a unique directory.",
+            file=sys.stderr,
         )
-    print(f"\n   Text -> {OUTPUT_TEXT}")
-    print(f"   Meta -> {OUTPUT_META}")
-    if errors:
-        print(f"\n   WARNING: {len(errors)} source(s) skipped due to errors:")
-        for path, err in errors:
-            print(f"     - {path.name}: {err}")
+        sys.exit(1)
+
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        _clean_workdir_stale_files()
+
+        extracted_sources = []
+        combined_texts = []
+        errors = []
+
+        no_cache = "--no-cache" in sys.argv[1:]
+
+        for file_path in input_files:
+            sha256 = None
+            cached = None
+            if not no_cache:
+                try:
+                    sha256 = _file_sha256(file_path)
+                    cached = _load_cache(sha256, file_path.name, extraction_mode)
+                except OSError:
+                    sha256 = None
+
+            if cached is not None:
+                res = cached
+                print(f"  [cache] reused unchanged source {file_path.name}")
+            else:
+                try:
+                    res = extract_single_file(file_path, extraction_mode, install_mode)
+                except ExtractionError as exc:
+                    print(f"WARNING: Skipping {file_path.name}: {exc}", file=sys.stderr)
+                    errors.append((file_path, str(exc)))
+                    continue
+                if sha256 is not None:
+                    _save_cache(sha256, file_path.name, extraction_mode, res)
+            if sha256 is not None:
+                res["file_sha256"] = sha256
+            extracted_sources.append(res)
+
+            # Format the text with a clear boundary
+            separator = f"\n\n{'=' * 80}\nSOURCE: {res['filename']} (Path: {res['source_file']})\n{'=' * 80}\n\n"
+            combined_texts.append(separator + res["text"])
+
+        if not extracted_sources:
+            print(f"\nERROR: All {len(errors)} source(s) failed extraction:", file=sys.stderr)
+            for path, err in errors:
+                print(f"  - {path.name}: {err}", file=sys.stderr)
+            sys.exit(1)
+
+        # Combine texts
+        consolidated_text = "".join(combined_texts).strip()
+
+        # Write combined text
+        OUTPUT_TEXT.write_text(consolidated_text, encoding="utf-8")
+
+        # Consolidate metadata
+        total_file_size_mb = sum(src["file_size_mb"] for src in extracted_sources)
+        total_pages = sum(src["pages"] for src in extracted_sources)
+        total_chars = len(consolidated_text)
+        total_words = len(consolidated_text.split())
+        total_tokens = estimate_tokens(consolidated_text)
+
+        # Detect structure from source content only. The generated SOURCE banners in
+        # full_text.txt use rows of "=", which can otherwise become phantom setext
+        # headings and make the result depend on the source-path length.
+        structure_text = "\n\n".join(src["text"] for src in extracted_sources)
+        consolidated_structure = detect_structure(structure_text)
+
+        metadata = {
+            "source_file": "Consolidated from multiple sources" if len(extracted_sources) > 1 else extracted_sources[0]["source_file"],
+            "filename": "multi-source" if len(extracted_sources) > 1 else extracted_sources[0]["filename"],
+            "format": "mixed" if len(extracted_sources) > 1 else extracted_sources[0]["format"],
+            "extraction_method": "multi-method" if len(extracted_sources) > 1 else extracted_sources[0]["extraction_method"],
+            "extraction_mode": extraction_mode,
+            "file_size_mb": round(total_file_size_mb, 2),
+            "pages": total_pages,
+            "chars": total_chars,
+            "words": total_words,
+            "estimated_tokens": total_tokens,
+            "estimated_tokens_human": f"~{total_tokens // 1000}K",
+            "output_text": str(OUTPUT_TEXT),
+            "total_sources": len(extracted_sources),
+            "sources": [
+                {
+                    "source_file": src["source_file"],
+                    "filename": src["filename"],
+                    "format": src["format"],
+                    "extraction_method": src["extraction_method"],
+                    "file_size_mb": src["file_size_mb"],
+                    "pages": src["pages"],
+                    "pages_label": src["pages_label"],
+                    "chars": src["chars"],
+                    "words": src["words"],
+                    "estimated_tokens": src["estimated_tokens"],
+                    "chapters_detected": src["chapters_detected"],
+                    "has_toc": src["has_toc"],
+                    "file_sha256": src.get("file_sha256")
+                }
+                for src in extracted_sources
+            ],
+            **consolidated_structure,
+        }
+
+        OUTPUT_META.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
+
+        page_line = f"   Total Pages: {total_pages}"
+        print("\nExtraction complete:")
+        print(f"   Sources : {len(extracted_sources)} processed")
+        print(f"   Size    : {total_file_size_mb:.2f} MB")
+        print(page_line)
+        print(f"   Words   : {total_words:,}")
+        print(f"   Tokens  : ~{total_tokens // 1000}K")
+        print(f"   Chapters: {consolidated_structure['chapters_detected']} detected overall")
+        print(f"   ToC     : {'yes' if consolidated_structure['has_toc'] else 'not detected'}")
+        if not consolidated_structure["has_toc"]:
+            print(
+                "   WARN    : No table of contents detected — chapter mapping in Step 3 "
+                "will rely on heading scan only, which may miss or duplicate sections."
+            )
+        print(f"\n   Text -> {OUTPUT_TEXT}")
+        print(f"   Meta -> {OUTPUT_META}")
+        if errors:
+            print(f"\n   WARNING: {len(errors)} source(s) skipped due to errors:")
+            for path, err in errors:
+                print(f"     - {path.name}: {err}")
+    finally:
+        _release_workdir_lock(lock_path)

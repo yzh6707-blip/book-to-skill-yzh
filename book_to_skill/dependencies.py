@@ -65,6 +65,16 @@ DEPENDENCY_GROUPS = [
         ],
         "note": "no fallback — Calibre is required for these formats",
     },
+    {
+        "label": "PDF (scanned: OCR)",
+        "modules": [],
+        "any_of_modules": True,
+        "system": [
+            ("tesseract", "tesseract OCR", "install tesseract (https://github.com/tesseract-ocr/tesseract)"),
+            ("pdftoppm", "poppler pdftoppm", "sudo apt install poppler-utils"),
+        ],
+        "note": "needed only for scanned PDFs with no text layer; both binaries required",
+    },
 ]
 
 

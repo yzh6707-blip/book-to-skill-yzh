@@ -2,11 +2,12 @@ import os
 import tempfile
 from pathlib import Path
 
+# Strip the env value: shells like cmd.exe's `set VAR=value && cmd` keep a
+# trailing space in the assignment, which produces a path that breaks
+# exists()/iterdir() consistency on Windows (WinError 3).
+_workdir_env = os.environ.get("BOOK_SKILL_WORKDIR", "").strip()
 OUTPUT_DIR = Path(
-    os.environ.get(
-        "BOOK_SKILL_WORKDIR",
-        str(Path(tempfile.gettempdir()) / "book_skill_work"),
-    )
+    _workdir_env or str(Path(tempfile.gettempdir()) / "book_skill_work")
 )
 OUTPUT_TEXT = OUTPUT_DIR / "full_text.txt"
 OUTPUT_META = OUTPUT_DIR / "metadata.json"
