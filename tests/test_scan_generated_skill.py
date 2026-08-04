@@ -177,6 +177,20 @@ def test_cli_returns_zero_for_clean_skill(tmp_path: Path, capsys):
     assert "scan passed" in capsys.readouterr().out
 
 
+def test_scanner_flags_bidi_override_controls(tmp_path: Path):
+    skill = _write_clean_skill(tmp_path / "bidi-reference")
+    (skill / "chapters" / "ch01.md").write_text(
+        "# Chapter 1\n\nHidden RLO override:\u202e456\u202c\n",
+        encoding="utf-8",
+    )
+
+    findings = scanner.scan_generated_skill(skill)
+    bidi_findings = [f for f in findings if f.rule_id == "unicode.invisible"]
+
+    assert bidi_findings
+    assert "U+202E" in bidi_findings[0].message
+
+
 def test_terminal_output_escapes_control_characters():
     escaped = scanner._terminal_safe("chapters/ch01\x1b[31m.md")
 

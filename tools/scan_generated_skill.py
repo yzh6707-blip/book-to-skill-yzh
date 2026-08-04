@@ -22,6 +22,15 @@ _INVISIBLE_CODEPOINTS = {
     0x200D,  # zero width joiner
     0x2060,  # word joiner
     0xFEFF,  # zero width no-break space (outside the leading BOM)
+    0x202A,  # left-to-right embedding (bidi override)
+    0x202B,  # right-to-left embedding (bidi override)
+    0x202C,  # pop directional formatting
+    0x202D,  # left-to-right override
+    0x202E,  # right-to-left override
+    0x2066,  # left-to-right isolate
+    0x2067,  # right-to-left isolate
+    0x2068,  # first strong isolate
+    0x2069,  # pop directional isolate
 }
 
 _CONTENT_RULES = (

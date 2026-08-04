@@ -20,6 +20,20 @@ INVISIBLE_CODEPOINTS = (
     "\U000e007f"
 )
 
+# Bidi override / isolate controls (U+202A–U+202E, U+2066–U+2069) are a
+# distinct, invisible prompt-injection vector and must also be stripped.
+BIDI_CONTROL_CODEPOINTS = (
+    "\u202a"
+    "\u202b"
+    "\u202c"
+    "\u202d"
+    "\u202e"
+    "\u2066"
+    "\u2067"
+    "\u2068"
+    "\u2069"
+)
+
 
 def test_sanitizer_removes_zero_width_and_tag_block_codepoints():
     sanitized, removed = sanitize_extracted_text(
@@ -28,6 +42,37 @@ def test_sanitizer_removes_zero_width_and_tag_block_codepoints():
 
     assert sanitized == "beforeafter"
     assert removed == len(INVISIBLE_CODEPOINTS)
+
+
+def test_sanitizer_removes_bidi_override_and_isolate_controls():
+    sanitized, removed = sanitize_extracted_text(
+        f"before{BIDI_CONTROL_CODEPOINTS}after"
+    )
+
+    assert sanitized == "beforeafter"
+    assert removed == len(BIDI_CONTROL_CODEPOINTS)
+
+
+def test_sanitizer_removes_combined_zero_width_and_bidi():
+    combined = INVISIBLE_CODEPOINTS + BIDI_CONTROL_CODEPOINTS
+    sanitized, removed = sanitize_extracted_text(f"x{combined}y")
+
+    assert sanitized == "xy"
+    assert removed == len(combined)
+
+
+def test_extract_single_file_sanitizes_bidi_before_metrics(tmp_path):
+    source = tmp_path / "source.txt"
+    # A classic bidi-smuggling shape: text that displays in a different
+    # order than it is stored ("123" renders as "456" via an RLO).
+    source.write_text("Code \u202e456\u202c is required here.", encoding="utf-8")
+
+    with mock.patch("book_to_skill.utils.prepare_dependencies"):
+        result = extract_single_file(source, "text", "no")
+
+    assert "\u202e" not in result["text"]
+    assert "\u202c" not in result["text"]
+    assert result["text"] == "Code 456 is required here."
 
 
 def test_sanitizer_preserves_normal_multilingual_text_byte_for_byte():
